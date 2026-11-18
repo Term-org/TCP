@@ -1,0 +1,173 @@
+name: Build bootstrap archives and apt repositories
+
+on:
+  workflow_dispatch:
+    inputs:
+      termux_packages_ref:
+        description: "termux-packages branch, tag or commit to build from"
+        required: false
+        default: "master"
+      release_tag:
+        description: "Release tag to publish, for example bootstrap-2026.11.18"
+        required: true
+  push:
+    tags:
+      - "bootstrap-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.app_id }} / ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        app_id:
+          - app.term.one
+          - app.term.two
+          - app.term.three
+          - app.term.four
+        arch:
+          - aarch64
+          - x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read extra packages
+        id: extras
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          import tomllib
+
+          with open("packages.toml", "rb") as handle:
+              data = tomllib.load(handle)
+
+          names = data.get("packages", [])
+          for name in names:
+              if not re.fullmatch(r"[a-z0-9][a-z0-9+._-]*", name):
+                  raise SystemExit("invalid package name in packages.toml: " + name)
+          print("list=" + " ".join(names))
+          PY
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Build bootstrap and packages
+        env:
+          TERMUX_PACKAGES_REF: ${{ inputs.termux_packages_ref || 'master' }}
+          TERM_EXTRA_PACKAGES: ${{ steps.extras.outputs.list }}
+        run: bash scripts/build-bootstrap.sh "${{ matrix.app_id }}" "${{ matrix.arch }}"
+
+      - name: Upload bootstrap archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ matrix.app_id }}-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.app_id }}-${{ matrix.arch }}
+          path: debs/${{ matrix.app_id }}/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.app_id }}-${{ matrix.arch }}
+          path: work/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: bootstrap-*
+          merge-multiple: true
+
+      - name: Check archives
+        run: |
+          ls -l dist
+          test "$(ls dist/*.zip | wc -l)" -eq 8
+          test "$(ls dist/*.sha256 | wc -l)" -eq 8
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Bootstrap $TAG" \
+            --notes "Bootstrap archives for TermOne, TermTwo, TermThree and TermFour (aarch64 and x86_64). Each archive is built for its own application id, so it must only be used by that app." \
+            --latest
+
+  repo:
+    name: Publish apt repositories
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: incoming
+          pattern: debs-*
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev apt-utils gnupg xz-utils gzip
+
+      - name: Import signing key
+        env:
+          TERM_GPG_PRIVATE_KEY: ${{ secrets.TERM_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TERM_GPG_PRIVATE_KEY" ]; then
+            echo "The secret TERM_GPG_PRIVATE_KEY is not set" >&2
+            exit 1
+          fi
+          printf '%s\n' "$TERM_GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format long
+
+      - name: Build repositories
+        run: bash scripts/build-apt-repo.sh incoming site
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

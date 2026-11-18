@@ -2,4 +2,9 @@ work/
 debs/
 site/
 incoming/
+out/
+debs/
+site/
+incoming/
+dist/
 private-key.asc
