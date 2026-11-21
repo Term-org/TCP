@@ -6,9 +6,9 @@ separate signed apt repository.
 
 ## Using it
 
-    tn community enable
-    tn update
-    tn install hello-term
+    tn tcp:activate
+    tn gp:update
+    tn hello-term:install
 
 ## Setup (maintainers)
 
