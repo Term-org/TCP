@@ -60,6 +60,9 @@ check_package() {
     fi
 
     skip="$(var_of TERMUX_PKG_SKIP_SRC_EXTRACT "$build")"
+    if [ "$skip" = "true" ] && ! grep -q '^termux_step_install_license()' "$build"; then
+        fail "a package without sources must define termux_step_install_license to install its own license"
+    fi
     if [ "$skip" != "true" ]; then
         srcurl="$(var_of TERMUX_PKG_SRCURL "$build")"
         sha="$(var_of TERMUX_PKG_SHA256 "$build")"
