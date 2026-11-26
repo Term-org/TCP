@@ -106,8 +106,64 @@ done
 
 # ---------------------------------------------------------------- build
 
+step "Preparing the builder container"
+container="${CONTAINER_NAME:-termux-package-builder}"
+: > "$log"
+mkdir -p "$work/output"
+cat > "$work/scripts/term-preflight.sh" <<'EOF'
+#!/bin/bash
+set -e
+echo "builder: uid=$(id -u) gid=$(id -g)"
+cd /home/builder/termux-packages
+mkdir -p output
+touch output/.write-test
+rm -f output/.write-test
+mkdir -p /data/data/.preflight
+rmdir /data/data/.preflight
+echo "the builder can write to the checkout and to /data"
+EOF
+chmod +x "$work/scripts/term-preflight.sh"
+echo "runner: uid=$(id -u) gid=$(id -g)"
+
+# The first call creates the container.
+( cd "$work" && ./scripts/run-docker.sh true ) || die "the builder container could not be started"
+
+# run-docker.sh tries to give the builder user the uid of the runner, which does not always work.
+# Opening up the checkout and /data from the inside makes the build independent of the uids.
+docker exec --user root "$container" sh -c '
+    chmod -R a+rwX /home/builder/termux-packages
+    mkdir -p /data/data /home/builder/.termux-build
+    chmod -R a+rwX /data
+    chown -R builder:builder /data /home/builder/.termux-build
+    chown builder:builder /home/builder
+' || die "could not prepare the builder container"
+
+if ! ( cd "$work" && ./scripts/run-docker.sh ./scripts/term-preflight.sh ); then
+    docker exec --user root "$container" sh -c 'id builder; ls -ld /home/builder /home/builder/termux-packages /data' || true
+    die "the builder cannot write to the checkout (see the ids above)"
+fi
+
+# Runs a command in the container and tries once more when a download failed.
+run_build() {
+    local attempt=1
+    while true; do
+        if ( cd "$work" && "$@" ) 2>&1 | tee -a "$log"; then
+            return 0
+        fi
+        if [ "$attempt" -ge 2 ] || ! tail -n 400 "$log" | grep -qE 'Connection timed out|Failed to download|Could not resolve host|Connection reset'; then
+            return 1
+        fi
+        attempt=$((attempt + 1))
+        echo "A download failed; trying again in 60 seconds (attempt $attempt)"
+        sleep 60
+    done
+}
+
 step "Building: ${packages[*]}"
-( cd "$work" && ./scripts/run-docker.sh ./build-package.sh -a "$arch" "${packages[@]}" ) 2>&1 | tee "$log"
+# -s skips the dependencies: they are not built here, they come from the TP repository when the
+# package is installed.
+run_build ./scripts/run-docker.sh ./build-package.sh -s -a "$arch" "${packages[@]}" \
+    || die "the build failed (see $log)"
 
 # ---------------------------------------------------------------- collect
 

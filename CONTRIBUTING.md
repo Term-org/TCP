@@ -14,6 +14,10 @@ Patches and `*.subpackage.sh` files live in the same directory.
 - The license must allow redistribution.
 - No prebuilt binaries and no file larger than 1 MB.
 - Never write `/data/data/com.termux`; use `$TERMUX_PREFIX`.
+- Dependencies are not built in this repository. The build skips them, so for now a package must not
+  need other packages at build time: scripts, data and configuration are fine, code that has to be
+  compiled against libraries is not. Runtime dependencies (`TERMUX_PKG_DEPENDS`) are still recorded
+  and installed from the TP repository. Support for compiled packages is planned.
 - A package without sources (`TERMUX_PKG_SKIP_SRC_EXTRACT=true`) must define `termux_step_install_license`
   and install its own license text, for example from a `LICENSE` file next to `build.sh`. The build
   refuses to continue without a license file.
