@@ -74,16 +74,11 @@ jobs:
           retention-days: 7
 
   repo:
-    name: Publish apt repositories
+    name: Build apt repositories
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout TCP
         uses: actions/checkout@v4
@@ -124,14 +119,22 @@ jobs:
           TERM_REPO_LABEL: Term Community Packages
         run: bash tp/scripts/build-apt-repo.sh incoming site
 
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-
       - name: Upload site
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
+  deploy:
+    name: Publish to GitHub Pages
+    needs: repo
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
