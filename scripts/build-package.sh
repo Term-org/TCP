@@ -41,7 +41,7 @@ if ! [[ "$app_id" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]]; then
     die "invalid application id: $app_id"
 fi
 
-for tool in git docker sed grep find; do
+for tool in git docker sed grep find sudo; do
     command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
 done
 
@@ -55,12 +55,87 @@ debs_dir="$root/debs/$app_id/$arch"
 log="$root/work/$app_id-$arch.log"
 expected_prefix="/data/data/$app_id/files/rootdir/usr"
 
+container="${CONTAINER_NAME:-termux-package-builder}"
+export CONTAINER_NAME="$container"
+
 for name in "${packages[@]}"; do
     [ -f "$root/packages/$name/build.sh" ] || die "unknown package: $name"
 done
 
 mkdir -p "$root/work"
 rm -rf "$work" "$debs_dir"
+: > "$log"
+
+# ---------------------------------------------------------------- helpers
+
+show_failure() {
+    echo
+    echo "==== lines of the log that mention errors ===="
+    { grep -nE 'error:|ERROR:|Error:|fatal|undefined reference|Permission denied|No such file|Failed to' "$log" | grep -v 'Werror' | tail -n 40; } || true
+    echo "==== last 30 lines of the log ===="
+    tail -n 30 "$log" || true
+}
+
+run_build() {
+    local attempt=1
+    while true; do
+        if ( cd "$work" && "$@" ) 2>&1 | tee -a "$log"; then
+            return 0
+        fi
+        if [ "$attempt" -ge 2 ] || ! tail -n 400 "$log" | grep -qE 'Connection timed out|Failed to download|Could not resolve host|Connection reset'; then
+            return 1
+        fi
+        attempt=$((attempt + 1))
+        echo "A download failed; trying again in 60 seconds (attempt $attempt)"
+        sleep 60
+    done
+}
+
+prepare_container() {
+    step "Preparing the builder container"
+
+    sudo chown -R "$(id -u):$(id -g)" "$root/work" || die "could not take over the work folder"
+    mkdir -p "$work/output"
+    echo "runner: uid=$(id -u) gid=$(id -g)"
+
+    # The restricted AppArmor profile of run-docker.sh blocks writes the build needs; see the TP repository.
+    if [ -f "$work/scripts/profile-relaxed.apparmor" ] && [ -f "$work/scripts/profile-restricted.apparmor" ]; then
+        cp "$work/scripts/profile-relaxed.apparmor" "$work/scripts/profile-restricted.apparmor"
+    fi
+
+    cat > "$work/scripts/term-preflight.sh" <<'EOF'
+#!/bin/bash
+set -e
+echo "builder: uid=$(id -u) gid=$(id -g)"
+cd /home/builder/termux-packages
+mkdir -p output
+touch output/.write-test
+rm -f output/.write-test
+touch .write-test
+rm -f .write-test
+mkdir -p /data/data/.preflight
+rmdir /data/data/.preflight
+echo "the builder can write to the checkout, to its output folder and to /data"
+EOF
+    chmod +x "$work/scripts/term-preflight.sh"
+
+    ( cd "$work" && ./scripts/run-docker.sh true ) || die "the builder container could not be started"
+
+    docker exec --user root "$container" sh -ec '
+        id builder
+        chmod a+rwx /home/builder/termux-packages
+        chmod -R a+rwX /home/builder/termux-packages
+        mkdir -p /data/data /home/builder/.termux-build
+        chmod -R a+rwX /data
+        chown -R builder:builder /data /home/builder/.termux-build
+        ls -ld /home/builder/termux-packages /home/builder/termux-packages/output
+    ' || die "could not open up the checkout inside the builder container"
+
+    if ! ( cd "$work" && ./scripts/run-docker.sh ./scripts/term-preflight.sh ); then
+        docker exec --user root "$container" sh -c 'id builder; ls -ld /home/builder /home/builder/termux-packages /data' || true
+        die "the builder cannot write to the checkout (see the ids above)"
+    fi
+}
 
 # ---------------------------------------------------------------- fetch
 
@@ -106,64 +181,15 @@ done
 
 # ---------------------------------------------------------------- build
 
-step "Preparing the builder container"
-container="${CONTAINER_NAME:-termux-package-builder}"
-: > "$log"
-mkdir -p "$work/output"
-cat > "$work/scripts/term-preflight.sh" <<'EOF'
-#!/bin/bash
-set -e
-echo "builder: uid=$(id -u) gid=$(id -g)"
-cd /home/builder/termux-packages
-mkdir -p output
-touch output/.write-test
-rm -f output/.write-test
-mkdir -p /data/data/.preflight
-rmdir /data/data/.preflight
-echo "the builder can write to the checkout and to /data"
-EOF
-chmod +x "$work/scripts/term-preflight.sh"
-echo "runner: uid=$(id -u) gid=$(id -g)"
-
-# The first call creates the container.
-( cd "$work" && ./scripts/run-docker.sh true ) || die "the builder container could not be started"
-
-# run-docker.sh tries to give the builder user the uid of the runner, which does not always work.
-# Opening up the checkout and /data from the inside makes the build independent of the uids.
-docker exec --user root "$container" sh -c '
-    chmod -R a+rwX /home/builder/termux-packages
-    mkdir -p /data/data /home/builder/.termux-build
-    chmod -R a+rwX /data
-    chown -R builder:builder /data /home/builder/.termux-build
-    chown builder:builder /home/builder
-' || die "could not prepare the builder container"
-
-if ! ( cd "$work" && ./scripts/run-docker.sh ./scripts/term-preflight.sh ); then
-    docker exec --user root "$container" sh -c 'id builder; ls -ld /home/builder /home/builder/termux-packages /data' || true
-    die "the builder cannot write to the checkout (see the ids above)"
-fi
-
-# Runs a command in the container and tries once more when a download failed.
-run_build() {
-    local attempt=1
-    while true; do
-        if ( cd "$work" && "$@" ) 2>&1 | tee -a "$log"; then
-            return 0
-        fi
-        if [ "$attempt" -ge 2 ] || ! tail -n 400 "$log" | grep -qE 'Connection timed out|Failed to download|Could not resolve host|Connection reset'; then
-            return 1
-        fi
-        attempt=$((attempt + 1))
-        echo "A download failed; trying again in 60 seconds (attempt $attempt)"
-        sleep 60
-    done
-}
+prepare_container
 
 step "Building: ${packages[*]}"
 # -s skips the dependencies: they are not built here, they come from the TP repository when the
 # package is installed.
-run_build ./scripts/run-docker.sh ./build-package.sh -s -a "$arch" "${packages[@]}" \
-    || die "the build failed (see $log)"
+if ! run_build ./scripts/run-docker.sh ./build-package.sh -s -a "$arch" "${packages[@]}"; then
+    show_failure
+    die "the build failed (see $log)"
+fi
 
 # ---------------------------------------------------------------- collect
 
